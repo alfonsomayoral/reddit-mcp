@@ -1,10 +1,12 @@
 """reddit-mcp: auth, comment sampling, wrapping and refusal reporting.
 
-No live network: every test injects an httpx.MockTransport. The server
-module is loaded by file path (the repo mcp/ dir shadows the SDK package
-name), the same way test_mcp_store.py loads its subject.
+No live network: every test injects an httpx.MockTransport through the
+module's TRANSPORT hook. The server is loaded by file path rather than
+imported, because it ships as a standalone stdio script that belongs to no
+installed package.
 """
 
+import base64
 import importlib.util
 import json
 from pathlib import Path
@@ -14,17 +16,52 @@ import pytest
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
+# The same server is checked into a second repository, where it sits under
+# mcp/reddit/ beside its sibling servers instead of at the root. Searching
+# both locations is what lets the two copies of this file stay
+# byte-identical: a fix travels between them as a straight copy, and nobody
+# has to notice that a one-line path constant needs editing on the way. The
+# candidates are ordered so the repository this file was written for wins if
+# a checkout somehow contains both.
+_SERVER_CANDIDATES = ("server.py", "mcp/reddit/server.py")
 
-def _load_module(name: str, rel_path: str):
-    spec = importlib.util.spec_from_file_location(name, REPO_ROOT / rel_path)
+
+def _server_path() -> Path:
+    for rel_path in _SERVER_CANDIDATES:
+        candidate = REPO_ROOT / rel_path
+        if candidate.is_file():
+            return candidate
+    raise FileNotFoundError(
+        f"no server module under {REPO_ROOT} at any of {', '.join(_SERVER_CANDIDATES)}")
+
+
+SERVER_PATH = _server_path()
+
+
+def _load_module(name: str, path: Path):
+    spec = importlib.util.spec_from_file_location(name, path)
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
 
 
-reddit = _load_module("reddit_mcp_server", "server.py")
+reddit = _load_module("reddit_mcp_server", SERVER_PATH)
 
 CLIENT_SECRET = "s3cr3t-do-not-leak"
+FILE_SECRET = "file-s3cr3t-do-not-leak"
+
+# Deliberately shaped like a file someone already keeps: a comment, a blank
+# line, an `export ` prefix, both quote styles, and a line that is not a
+# pair at all. Each of those is a way a real credentials file differs from
+# the tidy one a parser is usually written against.
+ENV_FILE_BODY = f"""\
+# credentials for the reader app
+export REDDIT_CLIENT_ID="file-client"
+
+REDDIT_CLIENT_SECRET='{FILE_SECRET}'
+REDDIT_USER_AGENT=file:reddit-mcp:v1 (by /u/tester)
+this line is not a pair
+"""
 
 
 class Backend:
@@ -39,6 +76,12 @@ class Backend:
         self.routes: dict[str, object] = {}
         self.token_status = 200
         self.token_ttl = 3600
+        # Credentials as Reddit would see them, decoded from the basic auth
+        # header: "<client id>:<secret>". Recorded so a test about where
+        # credentials come FROM can prove which ones arrived, rather than
+        # settling for the fact that some request succeeded.
+        self.token_auth: list[str] = []
+        self.user_agents: list[str] = []
         # Status returned for the NEXT api call, then popped. Used to make
         # the first call 401 and the retry succeed.
         self.next_status: list[int] = []
@@ -47,8 +90,12 @@ class Backend:
         self.routes[path] = payload
 
     def handler(self, request: httpx.Request) -> httpx.Response:
+        self.user_agents.append(request.headers.get("user-agent", ""))
         if request.url.path == "/api/v1/access_token":
             self.token_calls += 1
+            credentials = request.headers.get("authorization", "")
+            if credentials.startswith("Basic "):
+                self.token_auth.append(base64.b64decode(credentials[6:]).decode())
             if self.token_status != 200:
                 return httpx.Response(self.token_status, json={"error": "nope"})
             return httpx.Response(200, json={
@@ -95,7 +142,11 @@ def backend(monkeypatch):
     monkeypatch.setattr(reddit, "SLEEP", lambda _seconds: None)
     monkeypatch.setenv("REDDIT_CLIENT_ID", "client-id")
     monkeypatch.setenv("REDDIT_CLIENT_SECRET", CLIENT_SECRET)
-    monkeypatch.setenv("REDDIT_USER_AGENT", "agent-factory/reddit-mcp:v1 (by /u/tester)")
+    monkeypatch.setenv("REDDIT_USER_AGENT", "test:reddit-mcp:v1 (by /u/tester)")
+    # Cleared rather than assumed absent: a developer who exports this to
+    # talk to the real Reddit would otherwise have their own credentials
+    # quietly participate in the suite.
+    monkeypatch.delenv("REDDIT_ENV_FILE", raising=False)
     reddit.reset_state()
     yield api
     reddit.reset_state()
@@ -104,8 +155,11 @@ def backend(monkeypatch):
 # -- fixtures ----------------------------------------------------------------
 
 
-def _listing(children: list[dict]) -> dict:
-    return {"kind": "Listing", "data": {"children": children}}
+def _listing(children: list[dict], after: str | None = None) -> dict:
+    """A Reddit listing. `after` defaults to null, which is how Reddit says
+    this is the last page — the same thing it says for a listing that was
+    never paginated at all."""
+    return {"kind": "Listing", "data": {"children": children, "after": after}}
 
 
 def _post(**overrides) -> dict:
@@ -212,11 +266,17 @@ def test_a_second_401_stops_rather_than_looping(backend):
 def test_missing_credentials_report_setup_and_never_echo_the_secret(monkeypatch):
     monkeypatch.setattr(reddit, "SLEEP", lambda _seconds: None)
     monkeypatch.delenv("REDDIT_CLIENT_ID", raising=False)
+    monkeypatch.delenv("REDDIT_ENV_FILE", raising=False)
     monkeypatch.setenv("REDDIT_CLIENT_SECRET", CLIENT_SECRET)
     reddit.reset_state()
     out = reddit.search_posts("anything")
     assert out.startswith("search_posts error:")
-    assert "HUMAN-TASKS" in out
+    # The hint has to name the variables themselves. "Credentials are not
+    # configured" alone leaves the reader guessing at spellings, and a hint
+    # that instead named a file or a deployment would be describing a
+    # machine this process cannot see.
+    for var in ("REDDIT_CLIENT_ID", "REDDIT_CLIENT_SECRET", "REDDIT_USER_AGENT"):
+        assert var in out, f"the setup hint does not name {var}"
     assert CLIENT_SECRET not in out
 
 
@@ -224,6 +284,74 @@ def test_the_secret_never_reaches_a_successful_payload(backend):
     backend.route("/r/productivity/search", _listing([_post()]))
     out = reddit.search_posts("app that tracks", subreddit="productivity")
     assert CLIENT_SECRET not in out
+
+
+# -- credentials from a file -------------------------------------------------
+
+
+def _use_env_file(monkeypatch, path, body: str | None = None) -> None:
+    """Strip the credentials out of the environment and offer a file instead."""
+    if body is not None:
+        path.write_text(body, encoding="utf-8")
+    for var in ("REDDIT_CLIENT_ID", "REDDIT_CLIENT_SECRET", "REDDIT_USER_AGENT"):
+        monkeypatch.delenv(var, raising=False)
+    monkeypatch.setenv("REDDIT_ENV_FILE", str(path))
+    reddit.reset_state()
+
+
+def test_credentials_can_arrive_as_a_path_rather_than_as_values(backend, monkeypatch, tmp_path):
+    """The point of the file is that the caller launching this server never
+    has to hold the secret. Asserting only that the call succeeded would
+    pass on an implementation that fell back to some other id entirely, so
+    the credentials Reddit actually received are what is checked here."""
+    _use_env_file(monkeypatch, tmp_path / "reddit.env", ENV_FILE_BODY)
+    backend.route("/r/productivity/search", _listing([_post()]))
+    out = reddit.search_posts("x", subreddit="productivity")
+    assert out.startswith(reddit.UNTRUSTED_HEADER)
+    assert backend.token_auth == [f"file-client:{FILE_SECRET}"]
+    assert backend.user_agents[0] == "file:reddit-mcp:v1 (by /u/tester)"
+    assert FILE_SECRET not in out, "the secret from the file reached the payload"
+
+
+def test_the_environment_beats_the_file_variable_by_variable(backend, monkeypatch, tmp_path):
+    """Merged per variable, not all-or-nothing: an operator overriding one
+    value for one run must not have to restate the others, and the override
+    must actually win over the file that still contains the old value."""
+    _use_env_file(monkeypatch, tmp_path / "reddit.env", ENV_FILE_BODY)
+    monkeypatch.setenv("REDDIT_CLIENT_SECRET", CLIENT_SECRET)
+    backend.route("/r/productivity/search", _listing([_post()]))
+    reddit.search_posts("x", subreddit="productivity")
+    assert backend.token_auth == [f"file-client:{CLIENT_SECRET}"], (
+        "the file overrode an exported credential")
+
+
+def test_an_unusable_env_file_reports_setup_instead_of_raising(backend, monkeypatch, tmp_path):
+    """A path that leads nowhere has to land in the same place as an unset
+    variable. Letting the OSError out would turn a misconfiguration into a
+    traceback from inside a tool call, which says nothing about what to fix."""
+    _use_env_file(monkeypatch, tmp_path / "does-not-exist.env")
+    out = reddit.search_posts("x", subreddit="productivity")
+    assert out.startswith("search_posts error:")
+    assert "REDDIT_ENV_FILE" in out
+    assert backend.paths == [], "an unconfigured server still reached the network"
+
+
+def test_a_directory_where_a_file_was_promised_is_not_an_exception(backend, monkeypatch, tmp_path):
+    _use_env_file(monkeypatch, tmp_path)
+    out = reddit.search_posts("x", subreddit="productivity")
+    assert out.startswith("search_posts error:")
+
+
+def test_a_half_filled_env_file_never_echoes_what_it_did_supply(backend, monkeypatch, tmp_path):
+    """The error names the variables that are missing. It must not quote the
+    one that was found: the file exists to keep that value out of anything a
+    caller reads, and an error string is read by everyone."""
+    path = tmp_path / "reddit.env"
+    _use_env_file(monkeypatch, path, f"REDDIT_CLIENT_SECRET={FILE_SECRET}\n")
+    out = reddit.search_posts("x", subreddit="productivity")
+    assert out.startswith("search_posts error:")
+    assert FILE_SECRET not in out, "an error message quoted a credential"
+    assert "REDDIT_CLIENT_ID" in out
 
 
 # -- refusals are not empty results ------------------------------------------
@@ -243,6 +371,78 @@ def test_429_reports_the_reset_window_instead_of_retrying(backend):
     out = reddit.search_posts("x", subreddit="productivity")
     assert "429" in out and "42" in out
     assert len(backend.paths) == 1, "a rate-limited request was retried"
+
+
+def test_a_transient_503_is_retried_rather_than_ending_the_tool(backend):
+    """Reddit sheds load with a 503 that is usually gone a second later.
+    The request count is the assertion: "it eventually succeeded" would pass
+    on an implementation that never retried and simply got lucky."""
+    backend.route("/r/productivity/search", _listing([_post()]))
+    backend.next_status = [503, 503]
+    out = reddit.search_posts("x", subreddit="productivity")
+    assert out.startswith(reddit.UNTRUSTED_HEADER)
+    assert len(backend.paths) == 3, f"expected two retries then a success, got {backend.paths}"
+
+
+def test_a_5xx_that_never_clears_gives_up_and_says_it_tried(backend):
+    backend.route("/r/productivity/search", _listing([_post()]))
+    backend.next_status = [500, 502, 503, 504]
+    out = reddit.search_posts("x", subreddit="productivity")
+    assert out.startswith("search_posts error:")
+    assert "retries" in out, "the report does not distinguish a retried failure from a first try"
+    assert len(backend.paths) == 3, "the retry budget was not spent exactly"
+
+
+def test_the_backoff_grows_and_goes_through_the_sleep_hook(backend, monkeypatch):
+    """A retry loop with no pause is a way to turn one overloaded server
+    into two. The waits are recorded through the module hook, which is also
+    what keeps this suite from actually sleeping through them."""
+    slept: list[float] = []
+    monkeypatch.setattr(reddit, "SLEEP", slept.append)
+    backend.route("/r/productivity/search", _listing([_post()]))
+    backend.next_status = [503, 503]
+    reddit.search_posts("x", subreddit="productivity")
+    # The throttle sleeps through this hook too, but never for as long as a
+    # backoff: MIN_INTERVAL_S is well under a second.
+    backoffs = [wait for wait in slept if wait >= reddit.RETRY_BACKOFF_S]
+    assert backoffs == [1.0, 2.0], f"expected a growing backoff, got {backoffs}"
+
+
+@pytest.mark.parametrize("status", [400, 403, 404, 429])
+def test_a_4xx_is_an_answer_and_is_never_retried(backend, status):
+    """Asking the same question again only spends quota to hear the same
+    refusal twice."""
+    backend.route("/r/productivity/search", _listing([_post()]))
+    backend.next_status = [status]
+    out = reddit.search_posts("x", subreddit="productivity")
+    assert out.startswith("search_posts error:")
+    assert len(backend.paths) == 1, f"HTTP {status} was retried"
+
+
+def test_the_refresh_budget_and_the_retry_budget_add_rather_than_multiply(backend):
+    """The two mechanisms share one loop, so the failure to design against
+    is a 5xx retry that resets the 401 budget or vice versa. Four requests
+    is one attempt plus two transient retries plus one after a refresh;
+    eight would be the product, fired at an API already in trouble."""
+    backend.route("/r/productivity/search", _listing([_post()]))
+    backend.next_status = [503, 503, 401, 401]
+    out = reddit.search_posts("x", subreddit="productivity")
+    assert out.startswith("search_posts error:")
+    assert "401" in out
+    assert len(backend.paths) == 4, f"the budgets multiplied: {len(backend.paths)} requests"
+    assert backend.token_calls == 2, "the 401 bought more than one refresh"
+
+
+def test_a_503_before_a_401_still_leaves_the_refresh_available(backend):
+    """A transient failure must not spend the credential retry it never
+    used: the token that follows an outage is exactly the one most likely to
+    have expired while the caller was waiting."""
+    backend.route("/r/productivity/search", _listing([_post()]))
+    backend.next_status = [503, 401]
+    out = reddit.search_posts("x", subreddit="productivity")
+    assert out.startswith(reddit.UNTRUSTED_HEADER)
+    assert len(backend.paths) == 3
+    assert backend.token_calls == 2, "the 401 after a retry did not refresh the token"
 
 
 def test_unknown_subreddit_is_an_error_not_an_empty_list(backend):
@@ -271,11 +471,207 @@ def test_invalid_subreddit_names_cannot_rewrite_the_path(backend, name):
     assert backend.paths == [], "a malformed name reached the network"
 
 
+def test_several_communities_are_searched_as_one_reddit_listing(backend):
+    """Reddit reads `a+b+c` as a single listing drawn from all three, which
+    is one request instead of three and one ranking instead of three that a
+    caller would have to merge. The assertion is the path Reddit receives:
+    anything else would pass on an implementation that quietly searched only
+    the first name."""
+    backend.route("/r/productivity/search", _listing([]))
+    backend.route("/r/productivity+adhd+gtd/search", _listing([_post()]))
+    out = reddit.search_posts("x", subreddit="productivity+adhd+gtd")
+    assert out.startswith(reddit.UNTRUSTED_HEADER)
+    assert backend.paths == ["/r/productivity+adhd+gtd/search"], backend.paths
+
+
+def test_one_bad_component_rejects_the_whole_union(backend):
+    """Querying the parts that happen to be valid would answer a different
+    question under a heading claiming to cover the ones that were dropped."""
+    out = reddit.search_posts("x", subreddit="productivity+../../admin+gtd")
+    assert out.startswith("search_posts error: invalid subreddit name")
+    assert "../../admin" in out, "the error does not say which component was wrong"
+    assert backend.paths == [], "a malformed union reached the network"
+
+
+def test_a_union_is_capped_rather_than_growing_the_path_without_limit(backend):
+    out = reddit.search_posts("x", subreddit="+".join(f"sub{i}" for i in range(11)))
+    assert out.startswith("search_posts error:")
+    assert "at most 10" in out
+    assert backend.paths == []
+
+
+def test_a_single_name_still_reaches_the_single_community_path(backend):
+    """The union syntax must not leave a trailing separator or otherwise
+    reshape the ordinary case, which is the one every other test relies on."""
+    backend.route("/r/productivity/search", _listing([_post()]))
+    reddit.search_posts("x", subreddit="r/productivity/")
+    assert backend.paths == ["/r/productivity/search"]
+
+
+# -- pagination --------------------------------------------------------------
+
+
+def _recording_listing(backend, path: str, payload: dict) -> list[str | None]:
+    """Route `path` and capture the `after` parameter of each request to it."""
+    seen: list[str | None] = []
+
+    def respond(request: httpx.Request):
+        seen.append(request.url.params.get("after"))
+        return payload
+
+    backend.route(path, respond)
+    return seen
+
+
+def test_the_after_cursor_actually_reaches_reddit(backend):
+    """Accepting the argument and dropping it would return page one again,
+    which reads like a page of results, so the recorded request is the only
+    assertion that can tell the difference."""
+    seen = _recording_listing(backend, "/r/productivity/search", _listing([_post()]))
+    reddit.search_posts("x", subreddit="productivity", after="t3_abc123")
+    assert seen == ["t3_abc123"], f"the cursor did not reach the request: {seen}"
+
+
+def test_a_first_page_sends_no_cursor_at_all(backend):
+    """An empty string forwarded as after=  is not the same request as no
+    after at all, and Reddit is entitled to treat it differently."""
+    seen = _recording_listing(backend, "/r/productivity/search", _listing([_post()]))
+    reddit.search_posts("x", subreddit="productivity")
+    assert seen == [None]
+
+
+def test_a_listing_with_more_pages_hands_back_the_cursor_to_continue(backend):
+    backend.route("/r/productivity/search", _listing([_post()], after="t3_zzz999"))
+    out = reddit.search_posts("x", subreddit="productivity")
+    assert "next_after: t3_zzz999" in out
+    assert "after" in out.splitlines()[-2], "nothing tells the caller what to do with the cursor"
+
+
+def test_a_last_page_says_there_is_no_next_one(backend):
+    """Silence would be read as an answer. A caller has to be able to tell
+    "Reddit has no more of this" from "this server did not look"."""
+    backend.route("/r/productivity/search", _listing([_post()]))
+    out = reddit.search_posts("x", subreddit="productivity")
+    assert "next_after: none" in out
+
+
+def test_an_empty_page_still_reports_its_pagination_state(backend):
+    backend.route("/r/productivity/search", _listing([]))
+    out = reddit.search_posts("nothing matches", subreddit="productivity")
+    assert "no posts matched" in out
+    assert "next_after:" in out
+
+
+@pytest.mark.parametrize("cursor", ["abc123", "t3_", "t3_abc123 or 1=1", "../../x", "t4_abc123"])
+def test_a_cursor_that_is_not_a_fullname_never_reaches_the_request(backend, cursor):
+    """Reddit answers an unrecognised cursor with page one rather than an
+    error, so junk forwarded from here comes back looking like data."""
+    backend.route("/r/productivity/search", _listing([_post()]))
+    out = reddit.search_posts("x", subreddit="productivity", after=cursor)
+    assert out.startswith("search_posts error: invalid after cursor")
+    assert backend.paths == [], "a malformed cursor was forwarded to Reddit"
+
+
 @pytest.mark.parametrize("given", ["abc123", "t3_abc123", "/r/x/comments/abc123/slug/"])
 def test_post_ids_are_accepted_bare_prefixed_or_as_a_permalink(backend, given):
     backend.route("/comments/abc123", _thread(_many_comments(3)))
     out = reddit.thread_comments(given)
     assert out.startswith(reddit.UNTRUSTED_HEADER)
+
+
+# -- reading a community's own listing ---------------------------------------
+
+
+def test_a_community_can_be_read_without_inventing_a_query(backend):
+    """The tool exists because search_posts needs words to search for, and
+    the opening question of community research has none: what does this
+    place talk about. The endpoint and the window are the assertion."""
+    seen: list[dict] = []
+
+    def respond(request: httpx.Request):
+        seen.append(dict(request.url.params))
+        return _listing([_post()])
+
+    backend.route("/r/productivity/top", respond)
+    out = reddit.subreddit_posts("productivity")
+    assert out.startswith(reddit.UNTRUSTED_HEADER)
+    assert backend.paths == ["/r/productivity/top"], backend.paths
+    assert seen[0]["t"] == "month", seen
+    assert seen[0]["limit"] == "15", seen
+
+
+@pytest.mark.parametrize("sort", ["hot", "new", "top", "rising"])
+def test_each_listing_sort_reaches_its_own_endpoint(backend, sort):
+    backend.route(f"/r/productivity/{sort}", _listing([_post()]))
+    out = reddit.subreddit_posts("productivity", sort=sort)
+    assert out.startswith(reddit.UNTRUSTED_HEADER)
+    assert backend.paths == [f"/r/productivity/{sort}"]
+
+
+@pytest.mark.parametrize("sort", ["relevance", "comments", "controversial", ""])
+def test_a_sort_that_only_a_search_understands_is_refused_here(backend, sort):
+    """The listing vocabulary is not the search vocabulary. Forwarding
+    `relevance` to a listing endpoint earns a 400 from Reddit that names
+    nothing, so the refusal happens here where it can name the alternatives."""
+    out = reddit.subreddit_posts("productivity", sort=sort)
+    assert out.startswith("subreddit_posts error:")
+    assert "hot, new, top, rising" in out
+    assert backend.paths == [], "an unsupported sort reached Reddit"
+
+
+def test_a_nonsense_window_is_an_error_rather_than_an_argument_that_vanishes(backend):
+    backend.route("/r/productivity/top", _listing([_post()]))
+    out = reddit.subreddit_posts("productivity", time_filter="decade")
+    assert out.startswith("subreddit_posts error:")
+    assert "time_filter" in out
+    assert backend.paths == []
+
+
+def test_a_listing_post_reads_exactly_like_a_search_result(backend):
+    """Two tools that describe the same object differently make a caller
+    learn the format twice and get one of them wrong. The post fixture is
+    identical, so the rendered blocks must be too."""
+    backend.route("/r/productivity/search", _listing([_post()]))
+    backend.route("/r/productivity/top", _listing([_post()]))
+    searched = reddit.search_posts("x", subreddit="productivity")
+    listed = reddit.subreddit_posts("productivity")
+
+    def block(out: str) -> list[str]:
+        lines = out.splitlines()
+        start = next(i for i, ln in enumerate(lines) if ln.startswith("- title:"))
+        return lines[start:start + 9]
+
+    assert block(searched) == block(listed)
+    assert block(listed)[0].startswith("- title:")
+
+
+def test_a_listing_spans_several_communities_in_one_request(backend):
+    backend.route("/r/productivity+adhd/top", _listing([_post()]))
+    out = reddit.subreddit_posts("productivity+adhd")
+    assert out.startswith(reddit.UNTRUSTED_HEADER)
+    assert backend.paths == ["/r/productivity+adhd/top"]
+
+
+def test_a_listing_forwards_and_reports_the_page_cursor(backend):
+    seen = _recording_listing(backend, "/r/productivity/new",
+                              _listing([_post()], after="t3_zzz999"))
+    out = reddit.subreddit_posts("productivity", sort="new", after="t3_abc123")
+    assert seen == ["t3_abc123"], f"the cursor did not reach the request: {seen}"
+    assert "next_after: t3_zzz999" in out
+
+
+def test_a_listing_rejects_a_malformed_cursor_like_a_search_does(backend):
+    backend.route("/r/productivity/top", _listing([_post()]))
+    out = reddit.subreddit_posts("productivity", after="page2")
+    assert out.startswith("subreddit_posts error: invalid after cursor")
+    assert backend.paths == []
+
+
+def test_an_empty_listing_is_a_wrapped_answer_not_a_failure(backend):
+    backend.route("/r/productivity/top", _listing([]))
+    out = reddit.subreddit_posts("productivity")
+    assert out.startswith(reddit.UNTRUSTED_HEADER)
+    assert "this listing is empty" in out
 
 
 # -- comment sampling --------------------------------------------------------
@@ -434,11 +830,13 @@ def test_every_tool_wraps_its_payload(backend):
     backend.route("/r/productivity/about", {"data": {"display_name": "productivity"}})
     backend.route("/r/productivity/about/rules", {"rules": []})
     backend.route("/r/productivity/search", _listing([_post()]))
+    backend.route("/r/productivity/top", _listing([_post()]))
     backend.route("/comments/abc123", _thread(_many_comments(4)))
     for out in (
         reddit.subreddit_search("productivity apps"),
         reddit.subreddit_about("productivity"),
         reddit.search_posts("x", subreddit="productivity"),
+        reddit.subreddit_posts("productivity"),
         reddit.thread_comments("abc123"),
     ):
         assert out.startswith(reddit.UNTRUSTED_HEADER)
@@ -451,12 +849,17 @@ def test_every_tool_wraps_its_payload(backend):
 def test_the_server_exposes_no_tool_that_writes():
     """READ ONLY is a property of this tool surface, not only a promise the
     prompt makes. A tool that posts, votes or messages must never appear
-    here — if one is added, this is where that decision gets contested."""
+    here — if one is added, this is where that decision gets contested.
+
+    The list is written out by hand, and adding a tool means editing it
+    here as well. That is the point: an assertion that counted the
+    registrations, or matched them by prefix, would wave through the one
+    registration this test exists to catch."""
     exposed = {fn.__name__ for fn in (
         reddit.subreddit_search, reddit.subreddit_about,
-        reddit.search_posts, reddit.thread_comments,
+        reddit.search_posts, reddit.subreddit_posts, reddit.thread_comments,
     )}
-    source = (REPO_ROOT / "server.py").read_text(encoding="utf-8")
+    source = SERVER_PATH.read_text(encoding="utf-8")
     registered = {ln.split("(")[-1].rstrip(")\n") for ln in source.splitlines()
                   if ln.startswith("server.tool()(")}
     assert registered == exposed, f"unregistered or unexpected tools: {registered ^ exposed}"
