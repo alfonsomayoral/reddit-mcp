@@ -99,6 +99,7 @@ _SUBREDDIT_RE = re.compile(r"\A[A-Za-z0-9_]{2,21}\Z")
 # with a URI-too-long that this server cannot explain.
 MAX_SUBREDDIT_PARTS = 10
 _POST_ID_RE = re.compile(r"\A[a-z0-9]{4,12}\Z")
+_FULLNAME_RE = re.compile(r"\At3_[a-z0-9]{4,12}\Z")
 _TIME_FILTERS = ("hour", "day", "week", "month", "year", "all")
 _SORTS = ("relevance", "hot", "top", "new", "comments")
 
@@ -414,6 +415,49 @@ def _norm_post_id(post_id: str) -> str:
     return value
 
 
+def _norm_after(after: str) -> str:
+    """A page cursor is one of Reddit's own fullnames, handed straight back.
+
+    Checked rather than forwarded because of where it comes from: the caller
+    read it off the previous page, and a caller that composes its own text
+    can just as easily approximate it as copy it. Reddit does not reject a
+    cursor it does not recognise, it starts from the beginning instead, and
+    a silently repeated first page is the worst failure available here —
+    it looks exactly like a page of results, so a reader concludes the
+    community keeps saying the same thing rather than that pagination broke.
+    """
+    value = (after or "").strip().lower()
+    if not value:
+        return ""
+    if not _FULLNAME_RE.match(value):
+        raise RedditError(
+            f"invalid after cursor {after!r}: expected a Reddit fullname like t3_abc123, "
+            "copied from the next_after line of the previous page"
+        )
+    return value
+
+
+def _pagination_lines(payload: object) -> list[str]:
+    """The cursor for the next page, or an explicit statement that there is
+    none.
+
+    Saying nothing is the one option ruled out. A caller that sees no cursor
+    cannot tell "Reddit has no more of this" from "this server did not
+    look", and those lead to opposite next moves: conclude, or go and get
+    the rest. An absent line would be read as the first by anything that has
+    ever seen a complete answer here.
+    """
+    data = payload.get("data") if isinstance(payload, dict) else None
+    after = data.get("after") if isinstance(data, dict) else None
+    if not after:
+        return ["", "next_after: none (Reddit has no further pages for this request)"]
+    return [
+        "",
+        f"next_after: {after}",
+        "more pages exist: call again with after set to that value to continue",
+    ]
+
+
 def _norm_choice(value: str, allowed: tuple[str, ...], label: str) -> str:
     value = (value or "").strip().lower()
     if value not in allowed:
@@ -524,13 +568,15 @@ def subreddit_about(name: str) -> str:
 
 
 def search_posts(query: str, subreddit: str = "", time_filter: str = "year",
-                 sort: str = "relevance", limit: int = 15) -> str:
+                 sort: str = "relevance", limit: int = 15, after: str = "") -> str:
     """Search Reddit posts, optionally inside one subreddit or across
     several written as "a+b+c". Returns title, author handle, score, comment
     count, date, permalink and a trimmed body per post, wrapped as UNTRUSTED
     DATA. High-signal queries look like "what app do you use for X",
     "frustrated with <tool>", "any app that". time_filter:
-    hour/day/week/month/year/all. sort: relevance/hot/top/new/comments."""
+    hour/day/week/month/year/all. sort: relevance/hot/top/new/comments. The
+    reply ends in a next_after line; pass that value as `after` for the next
+    page, and it says so when there is no next page."""
     query = " ".join(str(query).split())
     if not query:
         return "search_posts error: query must not be empty"
@@ -542,6 +588,9 @@ def search_posts(query: str, subreddit: str = "", time_filter: str = "year",
             "limit": _clamp(limit, 1, SEARCH_LIMIT),
             "type": "link",
         }
+        cursor = _norm_after(after)
+        if cursor:
+            params["after"] = cursor
         if subreddit.strip():
             sub = _norm_subreddit(subreddit)
             params["restrict_sr"] = "1"
@@ -571,6 +620,7 @@ def search_posts(query: str, subreddit: str = "", time_filter: str = "year",
     if not children:
         lines.append("")
         lines.append("no posts matched this query in the requested window")
+    lines += _pagination_lines(payload)
     return wrap_untrusted(url, "\n".join(lines))
 
 

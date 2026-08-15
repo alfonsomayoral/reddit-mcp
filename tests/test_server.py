@@ -155,8 +155,11 @@ def backend(monkeypatch):
 # -- fixtures ----------------------------------------------------------------
 
 
-def _listing(children: list[dict]) -> dict:
-    return {"kind": "Listing", "data": {"children": children}}
+def _listing(children: list[dict], after: str | None = None) -> dict:
+    """A Reddit listing. `after` defaults to null, which is how Reddit says
+    this is the last page — the same thing it says for a listing that was
+    never paginated at all."""
+    return {"kind": "Listing", "data": {"children": children, "after": after}}
 
 
 def _post(**overrides) -> dict:
@@ -503,6 +506,70 @@ def test_a_single_name_still_reaches_the_single_community_path(backend):
     backend.route("/r/productivity/search", _listing([_post()]))
     reddit.search_posts("x", subreddit="r/productivity/")
     assert backend.paths == ["/r/productivity/search"]
+
+
+# -- pagination --------------------------------------------------------------
+
+
+def _recording_listing(backend, path: str, payload: dict) -> list[str | None]:
+    """Route `path` and capture the `after` parameter of each request to it."""
+    seen: list[str | None] = []
+
+    def respond(request: httpx.Request):
+        seen.append(request.url.params.get("after"))
+        return payload
+
+    backend.route(path, respond)
+    return seen
+
+
+def test_the_after_cursor_actually_reaches_reddit(backend):
+    """Accepting the argument and dropping it would return page one again,
+    which reads like a page of results, so the recorded request is the only
+    assertion that can tell the difference."""
+    seen = _recording_listing(backend, "/r/productivity/search", _listing([_post()]))
+    reddit.search_posts("x", subreddit="productivity", after="t3_abc123")
+    assert seen == ["t3_abc123"], f"the cursor did not reach the request: {seen}"
+
+
+def test_a_first_page_sends_no_cursor_at_all(backend):
+    """An empty string forwarded as after=  is not the same request as no
+    after at all, and Reddit is entitled to treat it differently."""
+    seen = _recording_listing(backend, "/r/productivity/search", _listing([_post()]))
+    reddit.search_posts("x", subreddit="productivity")
+    assert seen == [None]
+
+
+def test_a_listing_with_more_pages_hands_back_the_cursor_to_continue(backend):
+    backend.route("/r/productivity/search", _listing([_post()], after="t3_zzz999"))
+    out = reddit.search_posts("x", subreddit="productivity")
+    assert "next_after: t3_zzz999" in out
+    assert "after" in out.splitlines()[-2], "nothing tells the caller what to do with the cursor"
+
+
+def test_a_last_page_says_there_is_no_next_one(backend):
+    """Silence would be read as an answer. A caller has to be able to tell
+    "Reddit has no more of this" from "this server did not look"."""
+    backend.route("/r/productivity/search", _listing([_post()]))
+    out = reddit.search_posts("x", subreddit="productivity")
+    assert "next_after: none" in out
+
+
+def test_an_empty_page_still_reports_its_pagination_state(backend):
+    backend.route("/r/productivity/search", _listing([]))
+    out = reddit.search_posts("nothing matches", subreddit="productivity")
+    assert "no posts matched" in out
+    assert "next_after:" in out
+
+
+@pytest.mark.parametrize("cursor", ["abc123", "t3_", "t3_abc123 or 1=1", "../../x", "t4_abc123"])
+def test_a_cursor_that_is_not_a_fullname_never_reaches_the_request(backend, cursor):
+    """Reddit answers an unrecognised cursor with page one rather than an
+    error, so junk forwarded from here comes back looking like data."""
+    backend.route("/r/productivity/search", _listing([_post()]))
+    out = reddit.search_posts("x", subreddit="productivity", after=cursor)
+    assert out.startswith("search_posts error: invalid after cursor")
+    assert backend.paths == [], "a malformed cursor was forwarded to Reddit"
 
 
 @pytest.mark.parametrize("given", ["abc123", "t3_abc123", "/r/x/comments/abc123/slug/"])
