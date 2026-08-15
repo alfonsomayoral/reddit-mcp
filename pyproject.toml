@@ -1,0 +1,27 @@
+[project]
+name = "reddit-mcp"
+version = "1.0.0"
+description = "Read-only MCP server for the Reddit Data API: four GET-backed tools and no way to write"
+requires-python = ">=3.12"
+dependencies = [
+    "mcp>=2.0.0,<3",
+    "httpx>=0.27",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.0",
+    "ruff>=0.6",
+]
+
+[tool.uv]
+package = false
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
+pythonpath = ["."]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
