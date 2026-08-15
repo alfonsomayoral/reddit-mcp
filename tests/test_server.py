@@ -1,8 +1,9 @@
 """reddit-mcp: auth, comment sampling, wrapping and refusal reporting.
 
-No live network: every test injects an httpx.MockTransport. The server
-module is loaded by file path (the repo mcp/ dir shadows the SDK package
-name), the same way test_mcp_store.py loads its subject.
+No live network: every test injects an httpx.MockTransport through the
+module's TRANSPORT hook. The server is loaded by file path rather than
+imported, because it ships as a standalone stdio script that belongs to no
+installed package.
 """
 
 import importlib.util
@@ -95,7 +96,7 @@ def backend(monkeypatch):
     monkeypatch.setattr(reddit, "SLEEP", lambda _seconds: None)
     monkeypatch.setenv("REDDIT_CLIENT_ID", "client-id")
     monkeypatch.setenv("REDDIT_CLIENT_SECRET", CLIENT_SECRET)
-    monkeypatch.setenv("REDDIT_USER_AGENT", "agent-factory/reddit-mcp:v1 (by /u/tester)")
+    monkeypatch.setenv("REDDIT_USER_AGENT", "test:reddit-mcp:v1 (by /u/tester)")
     reddit.reset_state()
     yield api
     reddit.reset_state()
@@ -216,7 +217,12 @@ def test_missing_credentials_report_setup_and_never_echo_the_secret(monkeypatch)
     reddit.reset_state()
     out = reddit.search_posts("anything")
     assert out.startswith("search_posts error:")
-    assert "HUMAN-TASKS" in out
+    # The hint has to name the variables themselves. "Credentials are not
+    # configured" alone leaves the reader guessing at spellings, and a hint
+    # that instead named a file or a deployment would be describing a
+    # machine this process cannot see.
+    for var in ("REDDIT_CLIENT_ID", "REDDIT_CLIENT_SECRET", "REDDIT_USER_AGENT"):
+        assert var in out, f"the setup hint does not name {var}"
     assert CLIENT_SECRET not in out
 
 
