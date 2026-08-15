@@ -1,6 +1,6 @@
 """reddit-mcp: read-only access to the official Reddit Data API over stdio.
 
-Read-only by construction. This server exposes four GET-backed tools and no
+Read-only by construction. This server exposes five GET-backed tools and no
 tool that writes. A prompt that promises restraint can be argued with; a
 capability that does not exist cannot. Nothing here can post, comment, vote
 or DM, however a retrieved thread phrases its request.
@@ -102,6 +102,14 @@ _POST_ID_RE = re.compile(r"\A[a-z0-9]{4,12}\Z")
 _FULLNAME_RE = re.compile(r"\At3_[a-z0-9]{4,12}\Z")
 _TIME_FILTERS = ("hour", "day", "week", "month", "year", "all")
 _SORTS = ("relevance", "hot", "top", "new", "comments")
+
+# Deliberately not _SORTS. A subreddit listing and a search accept different
+# vocabularies — `relevance` and `comments` only mean something when there is
+# a query, `rising` only means something when there is not — and Reddit
+# answers the wrong one with a 400 that says nothing about which word was
+# wrong. Two tuples cost a line; one tuple costs a caller an unexplained
+# failure.
+_LISTING_SORTS = ("hot", "new", "top", "rising")
 
 # Bodies Reddit tombstones carry no evidence and cost context.
 _TOMBSTONES = {"[deleted]", "[removed]", ""}
@@ -491,6 +499,28 @@ def _permalink(data: dict) -> str:
     return f"https://www.reddit.com{link}" if link.startswith("/") else link
 
 
+def _post_lines(data: dict) -> list[str]:
+    """One post, rendered identically wherever posts are listed.
+
+    Shared rather than copied per tool so the two listing tools cannot drift
+    apart: a caller that has learned to read one of them should not have to
+    re-learn the other, and a field added to a copy is a difference nobody
+    notices until an answer comes back missing it.
+    """
+    return [
+        "",
+        f"- title: {_trim(data.get('title'), 300)}",
+        f"  post_id: {data.get('id')}",
+        f"  subreddit: r/{data.get('subreddit')}",
+        f"  author: u/{data.get('author')}",
+        f"  score: {data.get('score')}",
+        f"  num_comments: {data.get('num_comments')}",
+        f"  created_utc: {data.get('created_utc')}",
+        f"  permalink: {_permalink(data)}",
+        f"  body: {_trim(data.get('selftext'), SELFTEXT_CHARS)}",
+    ]
+
+
 # -- tools -------------------------------------------------------------------
 
 
@@ -604,22 +634,54 @@ def search_posts(query: str, subreddit: str = "", time_filter: str = "year",
     children = _children(payload)
     lines = [f"resultCount: {len(children)}"]
     for child in children:
-        data = child.get("data") or {}
-        lines += [
-            "",
-            f"- title: {_trim(data.get('title'), 300)}",
-            f"  post_id: {data.get('id')}",
-            f"  subreddit: r/{data.get('subreddit')}",
-            f"  author: u/{data.get('author')}",
-            f"  score: {data.get('score')}",
-            f"  num_comments: {data.get('num_comments')}",
-            f"  created_utc: {data.get('created_utc')}",
-            f"  permalink: {_permalink(data)}",
-            f"  body: {_trim(data.get('selftext'), SELFTEXT_CHARS)}",
-        ]
+        lines += _post_lines(child.get("data") or {})
     if not children:
         lines.append("")
         lines.append("no posts matched this query in the requested window")
+    lines += _pagination_lines(payload)
+    return wrap_untrusted(url, "\n".join(lines))
+
+
+# search_posts cannot ask a question that has no query in it. "What does this
+# community complain about most this month" is the highest-signal opening
+# move in community research, and it was unaskable: every phrasing of it as a
+# search query smuggles in an assumption about which words the complaints
+# happen to use, and returns the posts that share that vocabulary rather than
+# the ones the community actually pushed to the top.
+def subreddit_posts(subreddit: str, sort: str = "top", time_filter: str = "month",
+                    limit: int = 15, after: str = "") -> str:
+    """Read a community's own listing, no search query required. Answers
+    "what is this community talking about" directly. Returns the same fields
+    per post as search_posts, wrapped as UNTRUSTED DATA. subreddit accepts
+    one name or several written as "a+b+c". sort: hot/new/top/rising.
+    time_filter (applies to top): hour/day/week/month/year/all. The reply
+    ends in a next_after line; pass that value as `after` for the next
+    page, and it says so when there is no next page."""
+    try:
+        sub = _norm_subreddit(subreddit)
+        listing = _norm_choice(sort, _LISTING_SORTS, "sort")
+        params = {
+            # `t` is sent whatever the sort, because Reddit ignores it where
+            # it does not apply. It is still validated for every sort, so
+            # that a nonsense window is an error the caller can see rather
+            # than an argument that vanishes on the way out.
+            "t": _norm_choice(time_filter, _TIME_FILTERS, "time_filter"),
+            "limit": _clamp(limit, 1, SEARCH_LIMIT),
+        }
+        cursor = _norm_after(after)
+        if cursor:
+            params["after"] = cursor
+        url, payload = _get(f"/r/{sub}/{listing}", params)
+    except RedditError as exc:
+        return f"subreddit_posts error: {exc}"
+
+    children = _children(payload)
+    lines = [f"resultCount: {len(children)}"]
+    for child in children:
+        lines += _post_lines(child.get("data") or {})
+    if not children:
+        lines.append("")
+        lines.append("this listing is empty for the requested sort and window")
     lines += _pagination_lines(payload)
     return wrap_untrusted(url, "\n".join(lines))
 
@@ -761,6 +823,7 @@ server = MCPServer("reddit-mcp")
 server.tool()(subreddit_search)
 server.tool()(subreddit_about)
 server.tool()(search_posts)
+server.tool()(subreddit_posts)
 server.tool()(thread_comments)
 
 

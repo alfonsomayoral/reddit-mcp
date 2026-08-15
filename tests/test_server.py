@@ -579,6 +579,101 @@ def test_post_ids_are_accepted_bare_prefixed_or_as_a_permalink(backend, given):
     assert out.startswith(reddit.UNTRUSTED_HEADER)
 
 
+# -- reading a community's own listing ---------------------------------------
+
+
+def test_a_community_can_be_read_without_inventing_a_query(backend):
+    """The tool exists because search_posts needs words to search for, and
+    the opening question of community research has none: what does this
+    place talk about. The endpoint and the window are the assertion."""
+    seen: list[dict] = []
+
+    def respond(request: httpx.Request):
+        seen.append(dict(request.url.params))
+        return _listing([_post()])
+
+    backend.route("/r/productivity/top", respond)
+    out = reddit.subreddit_posts("productivity")
+    assert out.startswith(reddit.UNTRUSTED_HEADER)
+    assert backend.paths == ["/r/productivity/top"], backend.paths
+    assert seen[0]["t"] == "month", seen
+    assert seen[0]["limit"] == "15", seen
+
+
+@pytest.mark.parametrize("sort", ["hot", "new", "top", "rising"])
+def test_each_listing_sort_reaches_its_own_endpoint(backend, sort):
+    backend.route(f"/r/productivity/{sort}", _listing([_post()]))
+    out = reddit.subreddit_posts("productivity", sort=sort)
+    assert out.startswith(reddit.UNTRUSTED_HEADER)
+    assert backend.paths == [f"/r/productivity/{sort}"]
+
+
+@pytest.mark.parametrize("sort", ["relevance", "comments", "controversial", ""])
+def test_a_sort_that_only_a_search_understands_is_refused_here(backend, sort):
+    """The listing vocabulary is not the search vocabulary. Forwarding
+    `relevance` to a listing endpoint earns a 400 from Reddit that names
+    nothing, so the refusal happens here where it can name the alternatives."""
+    out = reddit.subreddit_posts("productivity", sort=sort)
+    assert out.startswith("subreddit_posts error:")
+    assert "hot, new, top, rising" in out
+    assert backend.paths == [], "an unsupported sort reached Reddit"
+
+
+def test_a_nonsense_window_is_an_error_rather_than_an_argument_that_vanishes(backend):
+    backend.route("/r/productivity/top", _listing([_post()]))
+    out = reddit.subreddit_posts("productivity", time_filter="decade")
+    assert out.startswith("subreddit_posts error:")
+    assert "time_filter" in out
+    assert backend.paths == []
+
+
+def test_a_listing_post_reads_exactly_like_a_search_result(backend):
+    """Two tools that describe the same object differently make a caller
+    learn the format twice and get one of them wrong. The post fixture is
+    identical, so the rendered blocks must be too."""
+    backend.route("/r/productivity/search", _listing([_post()]))
+    backend.route("/r/productivity/top", _listing([_post()]))
+    searched = reddit.search_posts("x", subreddit="productivity")
+    listed = reddit.subreddit_posts("productivity")
+
+    def block(out: str) -> list[str]:
+        lines = out.splitlines()
+        start = next(i for i, ln in enumerate(lines) if ln.startswith("- title:"))
+        return lines[start:start + 9]
+
+    assert block(searched) == block(listed)
+    assert block(listed)[0].startswith("- title:")
+
+
+def test_a_listing_spans_several_communities_in_one_request(backend):
+    backend.route("/r/productivity+adhd/top", _listing([_post()]))
+    out = reddit.subreddit_posts("productivity+adhd")
+    assert out.startswith(reddit.UNTRUSTED_HEADER)
+    assert backend.paths == ["/r/productivity+adhd/top"]
+
+
+def test_a_listing_forwards_and_reports_the_page_cursor(backend):
+    seen = _recording_listing(backend, "/r/productivity/new",
+                              _listing([_post()], after="t3_zzz999"))
+    out = reddit.subreddit_posts("productivity", sort="new", after="t3_abc123")
+    assert seen == ["t3_abc123"], f"the cursor did not reach the request: {seen}"
+    assert "next_after: t3_zzz999" in out
+
+
+def test_a_listing_rejects_a_malformed_cursor_like_a_search_does(backend):
+    backend.route("/r/productivity/top", _listing([_post()]))
+    out = reddit.subreddit_posts("productivity", after="page2")
+    assert out.startswith("subreddit_posts error: invalid after cursor")
+    assert backend.paths == []
+
+
+def test_an_empty_listing_is_a_wrapped_answer_not_a_failure(backend):
+    backend.route("/r/productivity/top", _listing([]))
+    out = reddit.subreddit_posts("productivity")
+    assert out.startswith(reddit.UNTRUSTED_HEADER)
+    assert "this listing is empty" in out
+
+
 # -- comment sampling --------------------------------------------------------
 
 
@@ -735,11 +830,13 @@ def test_every_tool_wraps_its_payload(backend):
     backend.route("/r/productivity/about", {"data": {"display_name": "productivity"}})
     backend.route("/r/productivity/about/rules", {"rules": []})
     backend.route("/r/productivity/search", _listing([_post()]))
+    backend.route("/r/productivity/top", _listing([_post()]))
     backend.route("/comments/abc123", _thread(_many_comments(4)))
     for out in (
         reddit.subreddit_search("productivity apps"),
         reddit.subreddit_about("productivity"),
         reddit.search_posts("x", subreddit="productivity"),
+        reddit.subreddit_posts("productivity"),
         reddit.thread_comments("abc123"),
     ):
         assert out.startswith(reddit.UNTRUSTED_HEADER)
@@ -752,10 +849,15 @@ def test_every_tool_wraps_its_payload(backend):
 def test_the_server_exposes_no_tool_that_writes():
     """READ ONLY is a property of this tool surface, not only a promise the
     prompt makes. A tool that posts, votes or messages must never appear
-    here — if one is added, this is where that decision gets contested."""
+    here — if one is added, this is where that decision gets contested.
+
+    The list is written out by hand, and adding a tool means editing it
+    here as well. That is the point: an assertion that counted the
+    registrations, or matched them by prefix, would wave through the one
+    registration this test exists to catch."""
     exposed = {fn.__name__ for fn in (
         reddit.subreddit_search, reddit.subreddit_about,
-        reddit.search_posts, reddit.thread_comments,
+        reddit.search_posts, reddit.subreddit_posts, reddit.thread_comments,
     )}
     source = SERVER_PATH.read_text(encoding="utf-8")
     registered = {ln.split("(")[-1].rstrip(")\n") for ln in source.splitlines()
