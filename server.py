@@ -89,6 +89,10 @@ TOP_COMMENTS = 25
 RECENT_COMMENTS = 15
 
 _SUBREDDIT_RE = re.compile(r"\A[A-Za-z0-9_]{2,21}\Z")
+_POST_ID_RE = re.compile(r"\A[a-z0-9]{4,12}\Z")
+_FULLNAME_RE = re.compile(r"\At3_[a-z0-9]{4,12}\Z")
+_TIME_FILTERS = ("hour", "day", "week", "month", "year", "all")
+_SORTS = ("relevance", "hot", "top", "new", "comments")
 
 # Reddit reads `a+b+c` in a path as one listing drawn from all three. The
 # cap is not about Reddit's own limit but about what comes back: the union
@@ -98,10 +102,6 @@ _SUBREDDIT_RE = re.compile(r"\A[A-Za-z0-9_]{2,21}\Z")
 # also keeps a generated name list from growing a path until Reddit answers
 # with a URI-too-long that this server cannot explain.
 MAX_SUBREDDIT_PARTS = 10
-_POST_ID_RE = re.compile(r"\A[a-z0-9]{4,12}\Z")
-_FULLNAME_RE = re.compile(r"\At3_[a-z0-9]{4,12}\Z")
-_TIME_FILTERS = ("hour", "day", "week", "month", "year", "all")
-_SORTS = ("relevance", "hot", "top", "new", "comments")
 
 # Deliberately not _SORTS. A subreddit listing and a search accept different
 # vocabularies — `relevance` and `comments` only mean something when there is
