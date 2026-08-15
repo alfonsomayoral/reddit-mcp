@@ -232,8 +232,9 @@ def _credentials() -> tuple[str, str, str]:
     return client_id, client_secret, user_agent or FALLBACK_USER_AGENT
 
 
-# (token, expires_at monotonic). Process-lifetime cache: a worker run is
-# minutes and a token lasts an hour, so this is fetched once per run.
+# (token, expires_at monotonic). Process-lifetime cache: a stdio server
+# lives as long as the session that spawned it, which is minutes, while a
+# token lasts an hour — so this is normally fetched exactly once.
 _TOKEN: tuple[str, float] | None = None
 _LAST_CALL_AT = 0.0
 _RATELIMIT: dict[str, str] = {}
@@ -527,8 +528,9 @@ def _post_lines(data: dict) -> list[str]:
 def subreddit_search(topic: str, limit: int = 10) -> str:
     """Find the subreddits where a niche is discussed. Returns name,
     subscribers, whether it is NSFW, and the public description for each,
-    wrapped as UNTRUSTED DATA. Use this first when a TaskSpec names a niche
-    rather than specific communities, then subreddit_about for the rules."""
+    wrapped as UNTRUSTED DATA. Use this first when the task names a niche
+    rather than specific communities, then subreddit_about for the rules,
+    and subreddit_posts or search_posts to read them."""
     topic = " ".join(str(topic).split())
     if not topic:
         return "subreddit_search error: topic must not be empty"
