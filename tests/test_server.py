@@ -6,6 +6,7 @@ imported, because it ships as a standalone stdio script that belongs to no
 installed package.
 """
 
+import base64
 import importlib.util
 import json
 from pathlib import Path
@@ -47,6 +48,20 @@ def _load_module(name: str, path: Path):
 reddit = _load_module("reddit_mcp_server", SERVER_PATH)
 
 CLIENT_SECRET = "s3cr3t-do-not-leak"
+FILE_SECRET = "file-s3cr3t-do-not-leak"
+
+# Deliberately shaped like a file someone already keeps: a comment, a blank
+# line, an `export ` prefix, both quote styles, and a line that is not a
+# pair at all. Each of those is a way a real credentials file differs from
+# the tidy one a parser is usually written against.
+ENV_FILE_BODY = f"""\
+# credentials for the reader app
+export REDDIT_CLIENT_ID="file-client"
+
+REDDIT_CLIENT_SECRET='{FILE_SECRET}'
+REDDIT_USER_AGENT=file:reddit-mcp:v1 (by /u/tester)
+this line is not a pair
+"""
 
 
 class Backend:
@@ -61,6 +76,12 @@ class Backend:
         self.routes: dict[str, object] = {}
         self.token_status = 200
         self.token_ttl = 3600
+        # Credentials as Reddit would see them, decoded from the basic auth
+        # header: "<client id>:<secret>". Recorded so a test about where
+        # credentials come FROM can prove which ones arrived, rather than
+        # settling for the fact that some request succeeded.
+        self.token_auth: list[str] = []
+        self.user_agents: list[str] = []
         # Status returned for the NEXT api call, then popped. Used to make
         # the first call 401 and the retry succeed.
         self.next_status: list[int] = []
@@ -69,8 +90,12 @@ class Backend:
         self.routes[path] = payload
 
     def handler(self, request: httpx.Request) -> httpx.Response:
+        self.user_agents.append(request.headers.get("user-agent", ""))
         if request.url.path == "/api/v1/access_token":
             self.token_calls += 1
+            credentials = request.headers.get("authorization", "")
+            if credentials.startswith("Basic "):
+                self.token_auth.append(base64.b64decode(credentials[6:]).decode())
             if self.token_status != 200:
                 return httpx.Response(self.token_status, json={"error": "nope"})
             return httpx.Response(200, json={
@@ -118,6 +143,10 @@ def backend(monkeypatch):
     monkeypatch.setenv("REDDIT_CLIENT_ID", "client-id")
     monkeypatch.setenv("REDDIT_CLIENT_SECRET", CLIENT_SECRET)
     monkeypatch.setenv("REDDIT_USER_AGENT", "test:reddit-mcp:v1 (by /u/tester)")
+    # Cleared rather than assumed absent: a developer who exports this to
+    # talk to the real Reddit would otherwise have their own credentials
+    # quietly participate in the suite.
+    monkeypatch.delenv("REDDIT_ENV_FILE", raising=False)
     reddit.reset_state()
     yield api
     reddit.reset_state()
@@ -234,6 +263,7 @@ def test_a_second_401_stops_rather_than_looping(backend):
 def test_missing_credentials_report_setup_and_never_echo_the_secret(monkeypatch):
     monkeypatch.setattr(reddit, "SLEEP", lambda _seconds: None)
     monkeypatch.delenv("REDDIT_CLIENT_ID", raising=False)
+    monkeypatch.delenv("REDDIT_ENV_FILE", raising=False)
     monkeypatch.setenv("REDDIT_CLIENT_SECRET", CLIENT_SECRET)
     reddit.reset_state()
     out = reddit.search_posts("anything")
@@ -251,6 +281,74 @@ def test_the_secret_never_reaches_a_successful_payload(backend):
     backend.route("/r/productivity/search", _listing([_post()]))
     out = reddit.search_posts("app that tracks", subreddit="productivity")
     assert CLIENT_SECRET not in out
+
+
+# -- credentials from a file -------------------------------------------------
+
+
+def _use_env_file(monkeypatch, path, body: str | None = None) -> None:
+    """Strip the credentials out of the environment and offer a file instead."""
+    if body is not None:
+        path.write_text(body, encoding="utf-8")
+    for var in ("REDDIT_CLIENT_ID", "REDDIT_CLIENT_SECRET", "REDDIT_USER_AGENT"):
+        monkeypatch.delenv(var, raising=False)
+    monkeypatch.setenv("REDDIT_ENV_FILE", str(path))
+    reddit.reset_state()
+
+
+def test_credentials_can_arrive_as_a_path_rather_than_as_values(backend, monkeypatch, tmp_path):
+    """The point of the file is that the caller launching this server never
+    has to hold the secret. Asserting only that the call succeeded would
+    pass on an implementation that fell back to some other id entirely, so
+    the credentials Reddit actually received are what is checked here."""
+    _use_env_file(monkeypatch, tmp_path / "reddit.env", ENV_FILE_BODY)
+    backend.route("/r/productivity/search", _listing([_post()]))
+    out = reddit.search_posts("x", subreddit="productivity")
+    assert out.startswith(reddit.UNTRUSTED_HEADER)
+    assert backend.token_auth == [f"file-client:{FILE_SECRET}"]
+    assert backend.user_agents[0] == "file:reddit-mcp:v1 (by /u/tester)"
+    assert FILE_SECRET not in out, "the secret from the file reached the payload"
+
+
+def test_the_environment_beats_the_file_variable_by_variable(backend, monkeypatch, tmp_path):
+    """Merged per variable, not all-or-nothing: an operator overriding one
+    value for one run must not have to restate the others, and the override
+    must actually win over the file that still contains the old value."""
+    _use_env_file(monkeypatch, tmp_path / "reddit.env", ENV_FILE_BODY)
+    monkeypatch.setenv("REDDIT_CLIENT_SECRET", CLIENT_SECRET)
+    backend.route("/r/productivity/search", _listing([_post()]))
+    reddit.search_posts("x", subreddit="productivity")
+    assert backend.token_auth == [f"file-client:{CLIENT_SECRET}"], (
+        "the file overrode an exported credential")
+
+
+def test_an_unusable_env_file_reports_setup_instead_of_raising(backend, monkeypatch, tmp_path):
+    """A path that leads nowhere has to land in the same place as an unset
+    variable. Letting the OSError out would turn a misconfiguration into a
+    traceback from inside a tool call, which says nothing about what to fix."""
+    _use_env_file(monkeypatch, tmp_path / "does-not-exist.env")
+    out = reddit.search_posts("x", subreddit="productivity")
+    assert out.startswith("search_posts error:")
+    assert "REDDIT_ENV_FILE" in out
+    assert backend.paths == [], "an unconfigured server still reached the network"
+
+
+def test_a_directory_where_a_file_was_promised_is_not_an_exception(backend, monkeypatch, tmp_path):
+    _use_env_file(monkeypatch, tmp_path)
+    out = reddit.search_posts("x", subreddit="productivity")
+    assert out.startswith("search_posts error:")
+
+
+def test_a_half_filled_env_file_never_echoes_what_it_did_supply(backend, monkeypatch, tmp_path):
+    """The error names the variables that are missing. It must not quote the
+    one that was found: the file exists to keep that value out of anything a
+    caller reads, and an error string is read by everyone."""
+    path = tmp_path / "reddit.env"
+    _use_env_file(monkeypatch, path, f"REDDIT_CLIENT_SECRET={FILE_SECRET}\n")
+    out = reddit.search_posts("x", subreddit="productivity")
+    assert out.startswith("search_posts error:")
+    assert FILE_SECRET not in out, "an error message quoted a credential"
+    assert "REDDIT_CLIENT_ID" in out
 
 
 # -- refusals are not empty results ------------------------------------------
