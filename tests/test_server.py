@@ -15,15 +15,36 @@ import pytest
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
+# The same server is checked into a second repository, where it sits under
+# mcp/reddit/ beside its sibling servers instead of at the root. Searching
+# both locations is what lets the two copies of this file stay
+# byte-identical: a fix travels between them as a straight copy, and nobody
+# has to notice that a one-line path constant needs editing on the way. The
+# candidates are ordered so the repository this file was written for wins if
+# a checkout somehow contains both.
+_SERVER_CANDIDATES = ("server.py", "mcp/reddit/server.py")
 
-def _load_module(name: str, rel_path: str):
-    spec = importlib.util.spec_from_file_location(name, REPO_ROOT / rel_path)
+
+def _server_path() -> Path:
+    for rel_path in _SERVER_CANDIDATES:
+        candidate = REPO_ROOT / rel_path
+        if candidate.is_file():
+            return candidate
+    raise FileNotFoundError(
+        f"no server module under {REPO_ROOT} at any of {', '.join(_SERVER_CANDIDATES)}")
+
+
+SERVER_PATH = _server_path()
+
+
+def _load_module(name: str, path: Path):
+    spec = importlib.util.spec_from_file_location(name, path)
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
 
 
-reddit = _load_module("reddit_mcp_server", "server.py")
+reddit = _load_module("reddit_mcp_server", SERVER_PATH)
 
 CLIENT_SECRET = "s3cr3t-do-not-leak"
 
@@ -462,7 +483,7 @@ def test_the_server_exposes_no_tool_that_writes():
         reddit.subreddit_search, reddit.subreddit_about,
         reddit.search_posts, reddit.thread_comments,
     )}
-    source = (REPO_ROOT / "server.py").read_text(encoding="utf-8")
+    source = SERVER_PATH.read_text(encoding="utf-8")
     registered = {ln.split("(")[-1].rstrip(")\n") for ln in source.splitlines()
                   if ln.startswith("server.tool()(")}
     assert registered == exposed, f"unregistered or unexpected tools: {registered ^ exposed}"
