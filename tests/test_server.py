@@ -370,6 +370,78 @@ def test_429_reports_the_reset_window_instead_of_retrying(backend):
     assert len(backend.paths) == 1, "a rate-limited request was retried"
 
 
+def test_a_transient_503_is_retried_rather_than_ending_the_tool(backend):
+    """Reddit sheds load with a 503 that is usually gone a second later.
+    The request count is the assertion: "it eventually succeeded" would pass
+    on an implementation that never retried and simply got lucky."""
+    backend.route("/r/productivity/search", _listing([_post()]))
+    backend.next_status = [503, 503]
+    out = reddit.search_posts("x", subreddit="productivity")
+    assert out.startswith(reddit.UNTRUSTED_HEADER)
+    assert len(backend.paths) == 3, f"expected two retries then a success, got {backend.paths}"
+
+
+def test_a_5xx_that_never_clears_gives_up_and_says_it_tried(backend):
+    backend.route("/r/productivity/search", _listing([_post()]))
+    backend.next_status = [500, 502, 503, 504]
+    out = reddit.search_posts("x", subreddit="productivity")
+    assert out.startswith("search_posts error:")
+    assert "retries" in out, "the report does not distinguish a retried failure from a first try"
+    assert len(backend.paths) == 3, "the retry budget was not spent exactly"
+
+
+def test_the_backoff_grows_and_goes_through_the_sleep_hook(backend, monkeypatch):
+    """A retry loop with no pause is a way to turn one overloaded server
+    into two. The waits are recorded through the module hook, which is also
+    what keeps this suite from actually sleeping through them."""
+    slept: list[float] = []
+    monkeypatch.setattr(reddit, "SLEEP", slept.append)
+    backend.route("/r/productivity/search", _listing([_post()]))
+    backend.next_status = [503, 503]
+    reddit.search_posts("x", subreddit="productivity")
+    # The throttle sleeps through this hook too, but never for as long as a
+    # backoff: MIN_INTERVAL_S is well under a second.
+    backoffs = [wait for wait in slept if wait >= reddit.RETRY_BACKOFF_S]
+    assert backoffs == [1.0, 2.0], f"expected a growing backoff, got {backoffs}"
+
+
+@pytest.mark.parametrize("status", [400, 403, 404, 429])
+def test_a_4xx_is_an_answer_and_is_never_retried(backend, status):
+    """Asking the same question again only spends quota to hear the same
+    refusal twice."""
+    backend.route("/r/productivity/search", _listing([_post()]))
+    backend.next_status = [status]
+    out = reddit.search_posts("x", subreddit="productivity")
+    assert out.startswith("search_posts error:")
+    assert len(backend.paths) == 1, f"HTTP {status} was retried"
+
+
+def test_the_refresh_budget_and_the_retry_budget_add_rather_than_multiply(backend):
+    """The two mechanisms share one loop, so the failure to design against
+    is a 5xx retry that resets the 401 budget or vice versa. Four requests
+    is one attempt plus two transient retries plus one after a refresh;
+    eight would be the product, fired at an API already in trouble."""
+    backend.route("/r/productivity/search", _listing([_post()]))
+    backend.next_status = [503, 503, 401, 401]
+    out = reddit.search_posts("x", subreddit="productivity")
+    assert out.startswith("search_posts error:")
+    assert "401" in out
+    assert len(backend.paths) == 4, f"the budgets multiplied: {len(backend.paths)} requests"
+    assert backend.token_calls == 2, "the 401 bought more than one refresh"
+
+
+def test_a_503_before_a_401_still_leaves_the_refresh_available(backend):
+    """A transient failure must not spend the credential retry it never
+    used: the token that follows an outage is exactly the one most likely to
+    have expired while the caller was waiting."""
+    backend.route("/r/productivity/search", _listing([_post()]))
+    backend.next_status = [503, 401]
+    out = reddit.search_posts("x", subreddit="productivity")
+    assert out.startswith(reddit.UNTRUSTED_HEADER)
+    assert len(backend.paths) == 3
+    assert backend.token_calls == 2, "the 401 after a retry did not refresh the token"
+
+
 def test_unknown_subreddit_is_an_error_not_an_empty_list(backend):
     out = reddit.subreddit_about("doesnotexist")
     assert out.startswith("subreddit_about error:")

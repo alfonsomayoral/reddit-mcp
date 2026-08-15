@@ -58,6 +58,16 @@ ENV_FILE_VAR = "REDDIT_ENV_FILE"
 # constant only keeps an unconfigured server from sending nothing at all.
 FALLBACK_USER_AGENT = "reddit-mcp/1.0"
 
+# Reddit sheds load with a 503 rather than a refusal, and that 503 is
+# usually gone by the next second. Aborting the tool on the first one throws
+# away a request that would have worked, so a handful of seconds of patience
+# buys back most of them. Two extra attempts at 1s and 2s is the whole
+# budget: past that the outage is longer than any caller wants to sit
+# through, and a report of what happened beats a process that looks hung.
+TRANSIENT_STATUSES = (500, 502, 503, 504)
+MAX_TRANSIENT_RETRIES = 2
+RETRY_BACKOFF_S = 1.0
+
 # Free tier is 100 QPM per client id, averaged over 10 minutes. A discovery
 # cycle spends dozens of calls, so the ceiling is never approached; this
 # floor exists so an accidental loop cannot burn the client id before a
@@ -277,15 +287,29 @@ def _throttle() -> None:
 def _get(path: str, params: dict | None = None) -> tuple[str, object]:
     """Authenticated GET against oauth.reddit.com. Returns (url, json).
 
-    A 401 buys exactly one token refresh and one retry: past that the
-    credentials are wrong rather than stale, and retrying a rejected client
-    id in a loop is how an app gets its access revoked.
+    Two things here retry, for opposite reasons, and they are counted
+    separately on purpose. A 401 buys exactly one token refresh and one
+    retry: past that the credentials are wrong rather than stale, and
+    retrying a rejected client id in a loop is how an app gets its access
+    revoked. A 5xx buys MAX_TRANSIENT_RETRIES attempts with backoff, because
+    Reddit sheds load with a 503 that is usually gone a second later.
+
+    Separate counters mean the two budgets add rather than multiply: the
+    worst case is four requests (one, plus two transient retries, plus one
+    after a refresh), not the eight a shared attempt counter would allow a
+    single tool call to fire at an API that is already unhappy. Nothing
+    below 500 is retried at all — a 403, 404 or 429 is an answer, and asking
+    the same question again only spends quota to receive it twice.
     """
     _, _, user_agent = _credentials()
     url = f"{API_BASE}{path}"
-    for attempt in (0, 1):
+    refreshes_left = 1
+    transient_left = MAX_TRANSIENT_RETRIES
+    force_refresh = False
+    while True:
         _throttle()
-        token = _token(force_refresh=attempt == 1)
+        token = _token(force_refresh=force_refresh)
+        force_refresh = False
         try:
             with _client(headers={
                 "User-Agent": user_agent,
@@ -299,7 +323,9 @@ def _get(path: str, params: dict | None = None) -> tuple[str, object]:
             if header in resp.headers:
                 _RATELIMIT[header] = resp.headers[header]
 
-        if resp.status_code == 401 and attempt == 0:
+        if resp.status_code == 401 and refreshes_left:
+            refreshes_left -= 1
+            force_refresh = True
             continue
         if resp.status_code == 401:
             raise RedditError(f"Reddit refused the token twice (HTTP 401); {_SETUP_HINT}")
@@ -316,13 +342,28 @@ def _get(path: str, params: dict | None = None) -> tuple[str, object]:
             )
         if resp.status_code == 404:
             raise RedditError(f"HTTP 404 for {path}: no such subreddit, post or listing")
+        if resp.status_code in TRANSIENT_STATUSES and transient_left:
+            transient_left -= 1
+            # Backoff through the module hook, never time.sleep: the suite
+            # replaces SLEEP, and a retry policy that a test cannot fast
+            # forward is a retry policy nobody tests.
+            SLEEP(RETRY_BACKOFF_S * (MAX_TRANSIENT_RETRIES - transient_left))
+            continue
+        if resp.status_code in TRANSIENT_STATUSES:
+            # Says that the retries happened. Reported as a bare status code
+            # this reads like a first attempt, and a caller cannot tell an
+            # outage worth waiting out from one this server never probed.
+            raise RedditError(
+                f"HTTP {resp.status_code} for {path}, still failing after "
+                f"{MAX_TRANSIENT_RETRIES} retries: Reddit is shedding load rather than "
+                "refusing the request"
+            )
         if resp.status_code >= 400:
             raise RedditError(f"HTTP {resp.status_code} for {path}")
         try:
             return str(resp.url), resp.json()
         except ValueError as exc:
             raise RedditError(f"{path} returned a body that is not JSON") from exc
-    raise RedditError(f"request to {path} exhausted its retry")  # unreachable
 
 
 # -- input validation --------------------------------------------------------
