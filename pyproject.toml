@@ -1,7 +1,7 @@
 [project]
 name = "reddit-mcp"
 version = "1.0.0"
-description = "Read-only MCP server for the Reddit Data API: four GET-backed tools and no way to write"
+description = "Read-only MCP server for the Reddit Data API: five GET-backed tools and no way to write"
 requires-python = ">=3.12"
 dependencies = [
     "mcp>=2.0.0,<3",

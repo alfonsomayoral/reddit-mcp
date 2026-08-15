@@ -16,23 +16,22 @@ import pytest
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
-# The same server is checked into a second repository, where it sits under
-# mcp/reddit/ beside its sibling servers instead of at the root. Searching
-# both locations is what lets the two copies of this file stay
-# byte-identical: a fix travels between them as a straight copy, and nobody
-# has to notice that a one-line path constant needs editing on the way. The
-# candidates are ordered so the repository this file was written for wins if
-# a checkout somehow contains both.
-_SERVER_CANDIDATES = ("server.py", "mcp/reddit/server.py")
+# The same server is also checked into a repository that keeps its servers
+# one directory each rather than at the root. Finding it either way is what
+# lets the two copies of this file stay byte-identical: a fix travels
+# between them as a straight copy, and nobody has to notice that a path
+# constant needs editing on the way. The root is tried first, so the layout
+# this file was written for wins if a checkout somehow holds both.
+_SERVER_GLOBS = ("server.py", "*/reddit/server.py")
 
 
 def _server_path() -> Path:
-    for rel_path in _SERVER_CANDIDATES:
-        candidate = REPO_ROOT / rel_path
-        if candidate.is_file():
-            return candidate
+    for pattern in _SERVER_GLOBS:
+        for candidate in sorted(REPO_ROOT.glob(pattern)):
+            if candidate.is_file():
+                return candidate
     raise FileNotFoundError(
-        f"no server module under {REPO_ROOT} at any of {', '.join(_SERVER_CANDIDATES)}")
+        f"no server module under {REPO_ROOT} matching {' or '.join(_SERVER_GLOBS)}")
 
 
 SERVER_PATH = _server_path()
