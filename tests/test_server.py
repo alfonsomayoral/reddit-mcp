@@ -468,6 +468,43 @@ def test_invalid_subreddit_names_cannot_rewrite_the_path(backend, name):
     assert backend.paths == [], "a malformed name reached the network"
 
 
+def test_several_communities_are_searched_as_one_reddit_listing(backend):
+    """Reddit reads `a+b+c` as a single listing drawn from all three, which
+    is one request instead of three and one ranking instead of three that a
+    caller would have to merge. The assertion is the path Reddit receives:
+    anything else would pass on an implementation that quietly searched only
+    the first name."""
+    backend.route("/r/productivity/search", _listing([]))
+    backend.route("/r/productivity+adhd+gtd/search", _listing([_post()]))
+    out = reddit.search_posts("x", subreddit="productivity+adhd+gtd")
+    assert out.startswith(reddit.UNTRUSTED_HEADER)
+    assert backend.paths == ["/r/productivity+adhd+gtd/search"], backend.paths
+
+
+def test_one_bad_component_rejects_the_whole_union(backend):
+    """Querying the parts that happen to be valid would answer a different
+    question under a heading claiming to cover the ones that were dropped."""
+    out = reddit.search_posts("x", subreddit="productivity+../../admin+gtd")
+    assert out.startswith("search_posts error: invalid subreddit name")
+    assert "../../admin" in out, "the error does not say which component was wrong"
+    assert backend.paths == [], "a malformed union reached the network"
+
+
+def test_a_union_is_capped_rather_than_growing_the_path_without_limit(backend):
+    out = reddit.search_posts("x", subreddit="+".join(f"sub{i}" for i in range(11)))
+    assert out.startswith("search_posts error:")
+    assert "at most 10" in out
+    assert backend.paths == []
+
+
+def test_a_single_name_still_reaches_the_single_community_path(backend):
+    """The union syntax must not leave a trailing separator or otherwise
+    reshape the ordinary case, which is the one every other test relies on."""
+    backend.route("/r/productivity/search", _listing([_post()]))
+    reddit.search_posts("x", subreddit="r/productivity/")
+    assert backend.paths == ["/r/productivity/search"]
+
+
 @pytest.mark.parametrize("given", ["abc123", "t3_abc123", "/r/x/comments/abc123/slug/"])
 def test_post_ids_are_accepted_bare_prefixed_or_as_a_permalink(backend, given):
     backend.route("/comments/abc123", _thread(_many_comments(3)))

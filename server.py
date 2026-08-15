@@ -89,6 +89,15 @@ TOP_COMMENTS = 25
 RECENT_COMMENTS = 15
 
 _SUBREDDIT_RE = re.compile(r"\A[A-Za-z0-9_]{2,21}\Z")
+
+# Reddit reads `a+b+c` in a path as one listing drawn from all three. The
+# cap is not about Reddit's own limit but about what comes back: the union
+# still returns `limit` posts however many communities feed it, so past a
+# handful each extra name only crowds the others out, and the caller who
+# wanted twenty communities wanted a search across Reddit instead. A cap
+# also keeps a generated name list from growing a path until Reddit answers
+# with a URI-too-long that this server cannot explain.
+MAX_SUBREDDIT_PARTS = 10
 _POST_ID_RE = re.compile(r"\A[a-z0-9]{4,12}\Z")
 _TIME_FILTERS = ("hour", "day", "week", "month", "year", "all")
 _SORTS = ("relevance", "hot", "top", "new", "comments")
@@ -370,12 +379,28 @@ def _get(path: str, params: dict | None = None) -> tuple[str, object]:
 
 
 def _norm_subreddit(name: str) -> str:
-    """Reddit names are [A-Za-z0-9_]; rejecting anything else here is what
-    keeps a caller-supplied name from rewriting the request path."""
+    """One subreddit name, or Reddit's `a+b+c` union of several.
+
+    Reddit names are [A-Za-z0-9_]; rejecting anything else here is what
+    keeps a caller-supplied name from rewriting the request path. Union
+    syntax makes that check load-bearing in a second way, since a `+` is now
+    a legitimate separator rather than a character to refuse outright: every
+    component is matched against the same rule, and one bad component
+    rejects the whole string. Dropping the invalid parts and querying the
+    rest would answer a question nobody asked, under a heading that claims
+    to cover the communities that were silently discarded.
+    """
     name = (name or "").strip().lstrip("/").removeprefix("r/").rstrip("/")
-    if not _SUBREDDIT_RE.match(name):
-        raise RedditError(f"invalid subreddit name {name!r}")
-    return name
+    parts = name.split("+")
+    if len(parts) > MAX_SUBREDDIT_PARTS:
+        raise RedditError(
+            f"at most {MAX_SUBREDDIT_PARTS} subreddits can be combined with '+', "
+            f"got {len(parts)}"
+        )
+    for part in parts:
+        if not _SUBREDDIT_RE.match(part):
+            raise RedditError(f"invalid subreddit name {part!r}")
+    return "+".join(parts)
 
 
 def _norm_post_id(post_id: str) -> str:
@@ -500,12 +525,12 @@ def subreddit_about(name: str) -> str:
 
 def search_posts(query: str, subreddit: str = "", time_filter: str = "year",
                  sort: str = "relevance", limit: int = 15) -> str:
-    """Search Reddit posts, optionally inside one subreddit. Returns title,
-    author handle, score, comment count, date, permalink and a trimmed body
-    per post, wrapped as UNTRUSTED DATA. High-signal queries look like
-    "what app do you use for X", "frustrated with <tool>", "any app that".
-    time_filter: hour/day/week/month/year/all. sort:
-    relevance/hot/top/new/comments."""
+    """Search Reddit posts, optionally inside one subreddit or across
+    several written as "a+b+c". Returns title, author handle, score, comment
+    count, date, permalink and a trimmed body per post, wrapped as UNTRUSTED
+    DATA. High-signal queries look like "what app do you use for X",
+    "frustrated with <tool>", "any app that". time_filter:
+    hour/day/week/month/year/all. sort: relevance/hot/top/new/comments."""
     query = " ".join(str(query).split())
     if not query:
         return "search_posts error: query must not be empty"
